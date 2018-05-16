@@ -1,12 +1,14 @@
 program FF_HI_semimp
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
+integer, parameter :: Ndtwidths = 5
 integer :: Nblocks, Nsteps, steps, block, time(1:8), kseed, i
-real*8 :: dt, sr, b, h, a, Q0, Ql
-real*8 :: Aeta, Veta, Apsi, Vpsi, Beta, Bpsi, Apsi2, Vpsi2, Bpsi2
+integer :: NTimeSteps, Ntraj, timestep, trajectories
+real*8 :: sr, b, h, a, Q0, Ql, Nrelax_times, dt, Beta, Bpsi, Bpsi2
 real*8, dimension(3,3) :: k, delT, tau
 real*8, dimension(3) :: Q, F
 integer, dimension(:), allocatable :: seed
+real*8, dimension(Ndtwidths):: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2
 
 call date_and_time(values=time)
 call random_seed(size=kseed)
@@ -14,14 +16,14 @@ allocate(seed(1:kseed))
 forall (i=1:kseed) seed(i) =time(8)*100000+time(7)*1000+time(6)*10+time(5)+12341293*real(i)
 call random_seed(put=seed)
 
-Nblocks = 5000
-Nsteps = 1000000
-dt = 0.1D0
+Ntraj = 100000
+Nrelax_times = 1
+timestepwidths = (/0.5D0,0.4D0,0.3D0,0.2D0,0.1D0/)
 sr = 1.D0
-b = 10000000D0
-h = 0.15D0
+b = 1000000000.D0
+h = 0.D0
 a = h*sqrt(PI)
-Q0 = 0
+Q0 = 0.D0
 
 k(:,:) = 0.D0
 k(1,2) = 1.D0
@@ -43,54 +45,61 @@ Vpsi2 = 0.D0
 
 Q(:) = (/1,1,1/)
 
-mainloop: do block=1,Nblocks
+looptimesteps: do timestep=1,Ndtwidths
 
-    tau(:,:) = 0.D0
+    dt = timestepwidths(timestep)
+    NtimeSteps = int(Nrelax_times/dt)
 
-    equilibration: do steps=1,100
-        k(:,:) = 0.D0
-        call step(Q, k, dt, Q0, delT, b, a)
-    end do equilibration
+    looptraj: do trajectories=1,Ntraj
 
-    do steps=1,Nsteps
-        k(1,2) = sr
-        call step(Q, k, dt, Q0, delT, b, a)
+        tau(:,:) = 0.D0
+
+        equil: do steps=1,int(10/dt)
+            k(:,:) = 0.D0
+            call step(Q, k, dt, Q0, delT, b, a)
+        end do equil
+
+        do steps=1,Ntimesteps
+            k(1,2) = sr
+            call step(Q, k, dt, Q0, delT, b, a)
+        end do
+
         Ql = sqrt(Q(1)**2 + Q(2)**2 + Q(3)**2)
         F(:) = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q(:)/Ql
-        tau(:,:) = tau(:,:) + dyadic_prod(Q,F)
+        tau = tau + dyadic_prod(Q,F)
 
-    end do
+        Beta = tau(1,2)/sr
+        Bpsi = (tau(1,1) - tau(2,2))/sr**2
+        Bpsi2 = (tau(2,2) - tau(3,3))/sr**2
+        Aeta(timestep) = Aeta(timestep) + Beta
+        Apsi(timestep) = Apsi(timestep) + Bpsi
+        Apsi2(timestep) = Apsi2(timestep) + Bpsi2
+        Veta(timestep) = Veta(timestep) + Beta**2
+        Vpsi(timestep) = Vpsi(timestep) + Bpsi**2
+        Vpsi2(timestep) = Vpsi2(timestep) + Bpsi2**2
 
-    Beta = tau(1,2)/(Nsteps*sr)
-    Bpsi = (tau(1,1) - tau(2,2))/(Nsteps*sr**2)
-    Bpsi2 = (tau(2,2) - tau(3,3))/(Nsteps*sr**2)
-    Aeta = Aeta + Beta
-    Apsi = Apsi + Bpsi
-    Apsi2 = Apsi2 + Bpsi2
-    Veta = Veta + Beta**2
-    Vpsi = Vpsi + Bpsi**2
-    Vpsi2 = Vpsi2 + Bpsi2**2
+    end do looptraj
 
-    if (mod(block,100).eq.0) then
-        write(*,*) "block = "
-        write(*,*) block
-    endif
+end do looptimesteps
 
-end do mainloop
+Aeta = Aeta/Ntraj
+Veta = Veta/Ntraj
+Veta = sqrt((Veta - Aeta**2)/(Ntraj-1))
 
-Aeta = Aeta/Nblocks
-Veta = Veta/Nblocks
-Veta = sqrt((Veta - Aeta**2)/(Nblocks-1))
+Apsi = Apsi/Ntraj
+Vpsi = Vpsi/Ntraj
+Vpsi = sqrt((Vpsi - Apsi**2)/(Ntraj-1))
 
-Apsi = Apsi/Nblocks
-Vpsi = Vpsi/Nblocks
-Vpsi = sqrt((Vpsi - Apsi**2)/(Nblocks-1))
+Apsi2 = Apsi2/Ntraj
+Vpsi2 = Vpsi2/Ntraj
+Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Ntraj-1))
 
-Apsi2 = Apsi2/Nblocks
-Vpsi2 = Vpsi2/Nblocks
-Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Nblocks-1))
 
-write(*,*) Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2
+10 format(F4.2,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X)
+do i = 1,Ndtwidths
+    write(*,10) timestepwidths(i), Aeta(i), Veta(i), Apsi(i), Vpsi(i), Apsi2(i), Vpsi2(i)
+end do
+
 
 contains
 
