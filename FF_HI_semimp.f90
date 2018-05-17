@@ -2,14 +2,15 @@ program FF_HI_semimp
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
 integer, parameter :: Ndtwidths = 1
-integer, parameter :: Ntraj = 100000
+integer, parameter :: Ntraj = 10000000
 integer :: Nblocks, Nsteps, steps, block, time(1:8), kseed, i
 integer :: NTimeSteps, timestep, trajectories
-real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Beta, Bpsi, Bpsi2
+real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, time1, time2, Ql, F(3)
 real*8, dimension(3,3) :: k, delT
-real*8, dimension(Ntraj,3,3) :: tau
-real*8, dimension(Ntraj, 3) :: Q, F, dW
-real*8, dimension(Ntraj) :: Ql
+!large arrays must be declared allocatable so they go into heap, otherwise
+!OpenMP threads run out of memory
+real*8, dimension(:,:,:), allocatable :: tau
+real*8, dimension(:, :), allocatable :: Q, dW
 integer, dimension(:), allocatable :: seed
 real*8, dimension(Ndtwidths):: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2
 
@@ -18,6 +19,11 @@ call random_seed(size=kseed)
 allocate(seed(1:kseed))
 forall (i=1:kseed) seed(i) =time(8)*100000+time(7)*1000+time(6)*10+time(5)+12341293*real(i)
 call random_seed(put=seed)
+deallocate(seed)
+
+allocate(tau(1:Ntraj,3,3))
+allocate(Q(1:Ntraj,3))
+allocate(dW(1:Ntraj,3))
 
 Nrelax_times = 1
 !timestepwidths = (/0.5D0,1.D0/3.D0,0.25D0,1.D0/12.D0,0.04D0/)
@@ -51,66 +57,85 @@ looptimesteps: do timestep=1,Ndtwidths
     dt = timestepwidths(timestep)
     NtimeSteps = int(Nrelax_times/dt)
 
+    call cpu_time(time1)
     do i=1,Ntraj
         tau(i,:,:) = 0.D0
         Q(i,:) = Wiener_step(dt)/sqrt(dt)
     end do
+    call cpu_time(time2)
+    write(*,*) 'setup cpu time'
+    write(*,*) time2-time1
 
-
-
+    call cpu_time(time1)
     do steps=1,Ntimesteps
         k(1,2) = sr
 
+!        call cpu_time(time1)
         do i=1,Ntraj
-            dW(i,:) = Wiener_step(dt)
+            dW(i, :) = Wiener_step(dt)
         end do
+!        call cpu_time(time2)
+!        write(*,*) 'RNG cpu time'
+!        write(*,*) time2-time1
 
-        forall(i=1:Ntraj)
+        !$OMP PARALLEL DO
+        do i=1,Ntraj
             Q(i,:) =  step(Q(i,:), k, dt, Q0, delT, b, a, dW(i,:))
-        end forall
+        end do
+        !$OMP END PARALLEL DO
+
     end do
+    call cpu_time(time2)
+    write(*,*) 'main loop cpu time'
+    write(*,*) time2-time1
 
-    forall(i=1:Ntraj)
-        Ql(i) = sqrt(Q(i,1)**2 + Q(i,2)**2 + Q(i,3)**2)
-        F(i,:) = (Ql(i) - Q0)/(1.0D0-(Ql(i)-Q0)**2/b)*Q(i,:)/Ql(i)
-        tau(i,:,:) = tau(1,:,:) + dyadic_prod(Q(i,:),F(i,:))
-    end forall
+    call cpu_time(time1)
+    !$OMP PARALLEL PRIVATE(Ql, F)
+    !$OMP DO
+    do i=1,Ntraj
+        Ql = sqrt(Q(i,1)**2 + Q(i,2)**2 + Q(i,3)**2)
+        F = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q(i,:)/Ql
+        tau(i,:,:) = tau(i,:,:) + dyadic_prod(Q(i,:),F)
+    end do
+    !$OMP END DO
 
-!    Beta = tau(1,2)/sr
-!    Bpsi = (tau(1,1) - tau(2,2))/sr**2
-!    Bpsi2 = (tau(2,2) - tau(3,3))/sr**2
-!    Aeta(timestep) = Aeta(timestep) + Beta
-!    Apsi(timestep) = Apsi(timestep) + Bpsi
-!    Apsi2(timestep) = Apsi2(timestep) + Bpsi2
-!    Veta(timestep) = Veta(timestep) + Beta**2
-!    Vpsi(timestep) = Vpsi(timestep) + Bpsi**2
-!    Vpsi2(timestep) = Vpsi2(timestep) + Bpsi2**2
+    !$OMP WORKSHARE
+    Aeta(timestep) = sum(tau(:,1,2))/sr
+    Apsi(timestep) = sum((tau(:,1,1) - tau(:,2,2)))/sr**2
+    Apsi2(timestep) = sum((tau(:,2,2) - tau(:,3,3)))/sr**2
+    Veta(timestep) = sum(tau(:,1,2)**2)/sr**2
+    Vpsi(timestep) = sum(((tau(:,1,1) - tau(:,2,2)))**2)/sr**4
+    Vpsi2(timestep) = sum(((tau(:,2,2) - tau(:,3,3)))**2)/sr**4
+    !$OMP END WORKSHARE
+    !$OMP END PARALLEL
+
+    call cpu_time(time2)
+    write(*,*) 'measurement CPU time'
+    write(*,*) time2-time1
 
 end do looptimesteps
 
-!write(*,'(F7.4,2X,F7.4,2X,F7.4)') Q
-!write(*,*) 'dW'
-!write(*,'(F7.4,2X,F7.4,2X,F7.4)') dW
-!write(*,*) Q
+deallocate(tau)
+deallocate(Q)
+deallocate(dW)
 
-!Aeta = Aeta/Ntraj
-!Veta = Veta/Ntraj
-!Veta = sqrt((Veta - Aeta**2)/(Ntraj-1))
-!
-!Apsi = Apsi/Ntraj
-!Vpsi = Vpsi/Ntraj
-!Vpsi = sqrt((Vpsi - Apsi**2)/(Ntraj-1))
-!
-!Apsi2 = Apsi2/Ntraj
-!Vpsi2 = Vpsi2/Ntraj
-!Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Ntraj-1))
-!
-!
-!10 format(F4.2,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X)
-!do i = 1,Ndtwidths
-!    write(*,10) timestepwidths(i), Aeta(i), Veta(i), Apsi(i), Vpsi(i), Apsi2(i), Vpsi2(i)
-!end do
+Aeta = Aeta/Ntraj
+Veta = Veta/Ntraj
+Veta = sqrt((Veta - Aeta**2)/(Ntraj-1))
 
+Apsi = Apsi/Ntraj
+Vpsi = Vpsi/Ntraj
+Vpsi = sqrt((Vpsi - Apsi**2)/(Ntraj-1))
+
+Apsi2 = Apsi2/Ntraj
+Vpsi2 = Vpsi2/Ntraj
+Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Ntraj-1))
+
+
+10 format(F4.2,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5,4X)
+do i = 1,Ndtwidths
+    write(*,10) timestepwidths(i), Aeta(i), Veta(i), Apsi(i), Vpsi(i), Apsi2(i), Vpsi2(i)
+end do
 
 contains
 
