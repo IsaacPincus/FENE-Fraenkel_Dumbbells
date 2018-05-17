@@ -1,33 +1,27 @@
 program FF_HI_semimp
+use omp_lib
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
-integer, parameter :: Ndtwidths = 1
+integer, parameter :: Ndtwidths = 5
 integer, parameter :: Ntraj = 10000000
-integer :: Nblocks, Nsteps, steps, block, time(1:8), kseed, i
+integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i
 integer :: NTimeSteps, timestep, trajectories
-real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, time1, time2, Ql, F(3)
+real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Ql, F(3), dW(3)
 real*8, dimension(3,3) :: k, delT
 !large arrays must be declared allocatable so they go into heap, otherwise
 !OpenMP threads run out of memory
 real*8, dimension(:,:,:), allocatable :: tau
-real*8, dimension(:, :), allocatable :: Q, dW
-integer, dimension(:), allocatable :: seed
+real*8, dimension(:, :), allocatable :: Q
 real*8, dimension(Ndtwidths):: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2
 
 call date_and_time(values=time)
-call random_seed(size=kseed)
-allocate(seed(1:kseed))
-forall (i=1:kseed) seed(i) =time(8)*100000+time(7)*1000+time(6)*10+time(5)+12341293*real(i)
-call random_seed(put=seed)
-deallocate(seed)
+seed = time(8)*100 + time(7)*10
 
 allocate(tau(1:Ntraj,3,3))
 allocate(Q(1:Ntraj,3))
-allocate(dW(1:Ntraj,3))
 
 Nrelax_times = 1
-!timestepwidths = (/0.5D0,1.D0/3.D0,0.25D0,1.D0/12.D0,0.04D0/)
-timestepwidths = (/0.1D0/)
+timestepwidths = (/0.5D0,1.D0/3.D0,0.25D0,1.D0/12.D0,0.04D0/)
 sr = 1.D0
 b = 1000000000.D0
 h = 0.D0
@@ -57,39 +51,25 @@ looptimesteps: do timestep=1,Ndtwidths
     dt = timestepwidths(timestep)
     NtimeSteps = int(Nrelax_times/dt)
 
-    call cpu_time(time1)
     do i=1,Ntraj
         tau(i,:,:) = 0.D0
-        Q(i,:) = Wiener_step(dt)/sqrt(dt)
+        Q(i,:) = Wiener_step(seed, dt)/sqrt(dt)
     end do
-    call cpu_time(time2)
-    write(*,*) 'setup cpu time'
-    write(*,*) time2-time1
 
-    call cpu_time(time1)
     do steps=1,Ntimesteps
         k(1,2) = sr
 
-!        call cpu_time(time1)
+        !$OMP PARALLEL PRIVATE(seed)
+        seed = seed + 932117 + OMP_get_thread_num()*2685821657736338717_8
+        !$OMP DO
         do i=1,Ntraj
-            dW(i, :) = Wiener_step(dt)
+            Q(i,:) =  step(Q(i,:), k, dt, Q0, delT, b, a)
         end do
-!        call cpu_time(time2)
-!        write(*,*) 'RNG cpu time'
-!        write(*,*) time2-time1
-
-        !$OMP PARALLEL DO
-        do i=1,Ntraj
-            Q(i,:) =  step(Q(i,:), k, dt, Q0, delT, b, a, dW(i,:))
-        end do
-        !$OMP END PARALLEL DO
+        !$OMP END DO
+        !$OMP END PARALLEL
 
     end do
-    call cpu_time(time2)
-    write(*,*) 'main loop cpu time'
-    write(*,*) time2-time1
 
-    call cpu_time(time1)
     !$OMP PARALLEL PRIVATE(Ql, F)
     !$OMP DO
     do i=1,Ntraj
@@ -109,15 +89,10 @@ looptimesteps: do timestep=1,Ndtwidths
     !$OMP END WORKSHARE
     !$OMP END PARALLEL
 
-    call cpu_time(time2)
-    write(*,*) 'measurement CPU time'
-    write(*,*) time2-time1
-
 end do looptimesteps
 
 deallocate(tau)
 deallocate(Q)
-deallocate(dW)
 
 Aeta = Aeta/Ntraj
 Veta = Veta/Ntraj
@@ -162,25 +137,38 @@ pure function construct_B(Q, a, delT)
 
 end function construct_B
 
-function Wiener_step(dt)
+function shift_xor(val,shift)
+    integer*8 :: shift_xor
+    integer*8, intent(in) :: val, shift
+    shift_xor = ieor(val,ishft(val,shift))
+end function
+
+function Wiener_step(seed, dt)
     implicit none
+    integer*8, intent(inout) :: seed
     real*8, intent(in) :: dt
     real*8, dimension(3) :: Wiener_step
     real*8, dimension(3) :: dW
+    integer :: i
 
-    call random_number(dW)
-    dW = dW - 0.5D0
+    do i=1,3
+        !Generates a random number between -0.5 and 0.5
+        !Using xorshift and one round of 64-bit MCG
+        seed = shift_xor(shift_xor(shift_xor(seed, 13_8),-17_8),43_8)
+        dW(i) = seed * 2685821657736338717_8 * 5.42101086242752217D-20
+    end do
 
+    !Generates an approximately gaussian-distributed number dW
     Wiener_step = dW*(14.14855378D0*sqrt(dt)*dW*dW + 1.21569221D0*sqrt(dt))
     return
 
 end function Wiener_step
 
-pure function step(Q, k, dt, Q0, delT, b, a, dW)
+function step(Q, k, dt, Q0, delT, b, a)
     implicit none
-    real*8, intent(in) :: Q(3), dt, Q0, b, a, dW(3)
+    real*8, intent(in) :: Q(3), dt, Q0, b, a
     real*8, intent(in) :: delT(3,3), k(3,3)
-    real*8 :: Ql, L, RdotB2_L, Qlength, temp_R1, temp_R2
+    real*8 :: Ql, L, RdotB2_L, Qlength, temp_R1, temp_R2, dW(3)
     real*8, dimension(3) :: F, u, RHS, Qpred, RdotB2
     real*8, dimension(3,3) :: B1, B2, B1B1, B2B2
     real*8, dimension(3) :: step
@@ -189,6 +177,7 @@ pure function step(Q, k, dt, Q0, delT, b, a, dW)
     F = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q/Ql
 
     B1 = construct_B(Q, a, delT)
+    dw = Wiener_step(seed, dt)
 
     B1B1 = matmul(B1,B1)
     Qpred = Q(:) + (ten_vec_dot(k,Q) - 0.5D0*ten_vec_dot(B1B1,F))*dt &
