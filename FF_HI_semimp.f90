@@ -3,7 +3,7 @@ use omp_lib
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
 integer, parameter :: Ndtwidths = 5
-integer, parameter :: Ntraj = 10000000
+integer, parameter :: Ntraj = 1000000
 integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i
 integer :: NTimeSteps, timestep, trajectories
 real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Ql, F(3), dW(3)
@@ -17,10 +17,10 @@ real*8, dimension(Ndtwidths):: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vp
 call date_and_time(values=time)
 seed = time(8)*100 + time(7)*10
 
-allocate(tau(1:Ntraj,3,3))
-allocate(Q(1:Ntraj,3))
+allocate(tau(3,3,1:Ntraj))
+allocate(Q(3,1:Ntraj))
 
-Nrelax_times = 1
+Nrelax_times = 10
 timestepwidths = (/0.5D0,1.D0/3.D0,0.25D0,1.D0/12.D0,0.04D0/)
 sr = 1.D0
 b = 1000000000.D0
@@ -46,50 +46,51 @@ Veta = 0.D0
 Vpsi = 0.D0
 Vpsi2 = 0.D0
 
+!$OMP PARALLEL PRIVATE(seed, Ql, F)
+seed = seed + 932117 + OMP_get_thread_num()*2685821657736338717_8
+
 looptimesteps: do timestep=1,Ndtwidths
 
     dt = timestepwidths(timestep)
     NtimeSteps = int(Nrelax_times/dt)
 
+    !$OMP DO
     do i=1,Ntraj
-        tau(i,:,:) = 0.D0
-        Q(i,:) = Wiener_step(seed, dt)/sqrt(dt)
+        tau(:,:,i) = 0.D0
+        Q(:,i) = Wiener_step(seed, dt)/sqrt(dt)
     end do
+    !$OMP END DO
 
     do steps=1,Ntimesteps
         k(1,2) = sr
 
-        !$OMP PARALLEL PRIVATE(seed)
-        seed = seed + 932117 + OMP_get_thread_num()*2685821657736338717_8
         !$OMP DO
         do i=1,Ntraj
-            Q(i,:) =  step(Q(i,:), k, dt, Q0, delT, b, a)
+            Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a)
         end do
         !$OMP END DO
-        !$OMP END PARALLEL
 
     end do
 
-    !$OMP PARALLEL PRIVATE(Ql, F)
     !$OMP DO
     do i=1,Ntraj
-        Ql = sqrt(Q(i,1)**2 + Q(i,2)**2 + Q(i,3)**2)
-        F = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q(i,:)/Ql
-        tau(i,:,:) = tau(i,:,:) + dyadic_prod(Q(i,:),F)
+        Ql = sqrt(Q(1,i)**2 + Q(2,i)**2 + Q(3,i)**2)
+        F = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q(:,i)/Ql
+        tau(:,:,i) = tau(:,:,i) + dyadic_prod(Q(:,i),F)
     end do
     !$OMP END DO
 
     !$OMP WORKSHARE
-    Aeta(timestep) = sum(tau(:,1,2))/sr
-    Apsi(timestep) = sum((tau(:,1,1) - tau(:,2,2)))/sr**2
-    Apsi2(timestep) = sum((tau(:,2,2) - tau(:,3,3)))/sr**2
-    Veta(timestep) = sum(tau(:,1,2)**2)/sr**2
-    Vpsi(timestep) = sum(((tau(:,1,1) - tau(:,2,2)))**2)/sr**4
-    Vpsi2(timestep) = sum(((tau(:,2,2) - tau(:,3,3)))**2)/sr**4
+    Aeta(timestep) = sum(tau(1,2,:))/sr
+    Apsi(timestep) = sum((tau(1,1,:) - tau(2,2,:)))/sr**2
+    Apsi2(timestep) = sum((tau(2,2,:) - tau(3,3,:)))/sr**2
+    Veta(timestep) = sum(tau(1,2,:)**2)/sr**2
+    Vpsi(timestep) = sum(((tau(1,1,:) - tau(2,2,:)))**2)/sr**4
+    Vpsi2(timestep) = sum(((tau(2,2,:) - tau(3,3,:)))**2)/sr**4
     !$OMP END WORKSHARE
-    !$OMP END PARALLEL
 
 end do looptimesteps
+!$OMP END PARALLEL
 
 deallocate(tau)
 deallocate(Q)
