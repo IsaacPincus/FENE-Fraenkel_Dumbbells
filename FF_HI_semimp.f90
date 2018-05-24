@@ -2,10 +2,8 @@ program FF_HI_semimp
 use omp_lib
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
-integer, parameter :: Ndtwidths = 5
-integer, parameter :: Ntraj = 80000
-integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i
-integer :: NTimeSteps, timestep, trajectories
+integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i, Ntraj
+integer :: NTimeSteps, timestep, trajectories, Ndtwidths
 real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Ql, F(3), dW(3), Qtemp(3)
 real*8 :: a2, a4, C43, C83, C143
 real*8, dimension(3,3) :: k, delT
@@ -13,22 +11,37 @@ real*8, dimension(3,3) :: k, delT
 !OpenMP threads run out of memory
 real*8, dimension(:,:,:), allocatable :: tau
 real*8, dimension(:, :), allocatable :: Q
-real*8, dimension(Ndtwidths):: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2, Qavg, Vqavg
+real*8, dimension(:), allocatable :: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2, Qavg, Vqavg
 
 call date_and_time(values=time)
 seed = time(8)*100 + time(7)*10
 
+open(unit=31, file='inputparameters.inp')
+open(unit=30, file='timestepdata.inp')
+
+read (31, *) sr, b, h, Q0
+read (30, *) Ntraj, Ndtwidths, Nrelax_times
+allocate(timestepwidths(Ndtwidths))
+do i=1,Ndtwidths
+    read(30, *) timestepwidths(i)
+end do
+
 allocate(tau(3,3,1:Ntraj))
 allocate(Q(3,1:Ntraj))
+allocate(Aeta(Ndtwidths), Veta(Ndtwidths), Apsi(Ndtwidths), Vpsi(Ndtwidths))
+allocate(Apsi2(Ndtwidths), Vpsi2(Ndtwidths), Qavg(Ndtwidths), Vqavg(Ndtwidths))
+Aeta = 0.D0
+Apsi = 0.D0
+Apsi2 = 0.D0
+Veta = 0.D0
+Vpsi = 0.D0
+Vpsi2 = 0.D0
 
-Nrelax_times = 100
-timestepwidths = (/0.5D0,1.D0/3.D0,0.25D0,1.D0/12.D0,0.04D0/)
-!timestepwidths = (/0.01D0/)
-sr = 0.D0
-b = 1.D0
-h = 0.D0
-a = h*sqrt(PI)
-Q0 = 0.D0
+!sr = 0.D0
+!b = 1.D0
+!h = 0.D0
+!a = h*sqrt(PI)
+!Q0 = 0.D0
 
 a2 = a**2
 a4 = a**4
@@ -47,13 +60,6 @@ delT(1,1) = 1.D0
 delT(2,2) = 1.D0
 delT(3,3) = 1.D0
 
-Aeta = 0.D0
-Apsi = 0.D0
-Apsi2 = 0.D0
-Veta = 0.D0
-Vpsi = 0.D0
-Vpsi2 = 0.D0
-
 looptimesteps: do timestep=1,Ndtwidths
 
     dt = timestepwidths(timestep)
@@ -61,7 +67,7 @@ looptimesteps: do timestep=1,Ndtwidths
 
     do i=1,Ntraj
         tau(:,:,i) = 0.D0
-        Q(:,i) = (/-1.D0, -1.D0, -1.D0/)
+        Q(:,i) = (/0.1D0, 0.1D0, 0.1D0/)
     end do
 
     !$OMP PARALLEL DEFAULT(firstprivate) SHARED(Q)
@@ -123,9 +129,15 @@ Vqavg = sqrt((Qavg**2 - Vqavg**2)/(Ntraj-1))
 !                Apsi2(i), Vpsi2(i), Qavg(i), Vqavg(i)
 !end do
 
+open(unit=20, file='to_textra.dat')
+
 10 format(F4.2,4X,F7.5,4X,F7.5)
 do i = 1,Ndtwidths
     write(*,10) timestepwidths(i), Qavg(i), Vqavg(i)
+end do
+
+do i = 1,Ndtwidths
+    write(20,10) timestepwidths(i), Qavg(i), Vqavg(i)
 end do
 
 contains
