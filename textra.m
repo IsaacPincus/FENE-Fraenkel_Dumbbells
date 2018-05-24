@@ -10,7 +10,7 @@ x = data(:,1);
 y = data(:,2);
 dy = data(:,3);
 
-iflag = 1;
+iflag = 0;
 min_err = 100;
 intercept = 100;
 
@@ -44,12 +44,22 @@ for i = 1:length(x)-1
                 pfin = p;
             end
         end
+
+%         if chi2val < storage(i,j,4)
+%             if chi2val/(length(xi) - length(p)) < min_err
+%                 min_err = chi2val/(length(xi) - length(p));
+%                 
+%                 final_coeff = coeff;
+%                 final_err = error;
+%                 pfin = p;
+%             end
+%         end
     end
 end
 
 figure();
 hold on
-plot([0;x], bsxfun(@power, [0;x], pfin)*final_coeff, 'b-');
+plot([x;0], bsxfun(@power, [x;0], pfin)*final_coeff, 'b-');
 plot(x, y, 'ro');
 title('TEXTRA minimum error extrapolation')
 xlabel('\Deltat, timestep width')
@@ -57,8 +67,13 @@ ylabel('Extrapolated quantity')
 hold off
 
 function [coeff, error, Q] = pfit2(p, x, y, dy)
+    %Implements polyfit scheme in 15.4 Numerical Methods 3rd Ed
+        % p is horizontal array containing polynomial powers
+        % x is timestep widths (or general x-data)
+        % y is dependent data
+        % dy is standard error in each y point
+    
     V = bsxfun(@power, x, p);
-
     A = V./dy;
     b = y./dy;
     alpha = A'*A;
@@ -67,7 +82,6 @@ function [coeff, error, Q] = pfit2(p, x, y, dy)
     error = sqrt(diag(alpha^-1));
     
     pi = V*coeff;
-
     Q = sum((y-pi).^2./dy.^2);
 end
 
