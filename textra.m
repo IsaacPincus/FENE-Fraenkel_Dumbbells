@@ -49,8 +49,11 @@ end
 
 figure();
 hold on
-plot(x, bsxfun(@power, x, pfin)*final_coeff, 'b-');
+plot([0;x], bsxfun(@power, [0;x], pfin)*final_coeff, 'b-');
 plot(x, y, 'ro');
+title('TEXTRA minimum error extrapolation')
+xlabel('\Deltat, timestep width')
+ylabel('Extrapolated quantity')
 hold off
 
 function [coeff, error, Q] = pfit2(p, x, y, dy)
