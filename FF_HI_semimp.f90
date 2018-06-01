@@ -163,20 +163,21 @@ function shift_xor(val,shift)
     shift_xor = ieor(val,ishft(val,shift))
 end function
 
-function random_float(seed, N)
+function rand_floats(seed, N)
     implicit none
+    integer*8, intent(in) :: N
     integer*8, intent(inout) :: seed
-    real*8, dimension(N) :: random_float
+    real*8, dimension(N) :: rand_floats
     integer :: i
 
     do i=1,N
         !Generates a random number between 0 and 1
         !Using xorshift and one round of 64-bit MCG
         seed = shift_xor(shift_xor(shift_xor(seed, 13_8),-17_8),43_8)
-        random_float(i) = seed * 2685821657736338717_8 * 5.42101086242752217D-20 + 0.5D0
+        rand_floats(i) = seed * 2685821657736338717_8 * 5.42101086242752217D-20 + 0.5D0
     end do
 
-end function random_float
+end function rand_floats
 
 function Wiener_step(seed, dt)
     implicit none
@@ -245,7 +246,7 @@ end function step
 
 pure function find_roots(a, b, c, Q0, lim)
     implicit none
-    real*8, parameter :: PI = 4*atan(1.0D0)
+!    real*8, parameter :: PI = 4*atan(1.0D0)
     real*8, intent(in) :: a, b, c, Q0, lim
     real*8 :: find_roots
     real*8 :: Q, R, theta, x
@@ -305,9 +306,9 @@ function psiQ_FF(Q, b, Q0)
     real*8 :: Jeq
     real*8 :: psiQ_FF
 
-    Jeq = (1.D0/(b+3.D0)+Q0**2/b)*beta(0.5D0,(b+2.D0)/2.D0)
+    Jeq = (1.D0/(b+3.D0)+Q0**2/b)*beta(0.5D0,(b+2.D0)/2.D0)*b**(1.5D0)
 
-    psiQ_FF = (1.D0-(Q-Q0)**2.D0/b)**(b/2.D0)/Jeq
+    psiQ_FF = Q**2*(1.D0-(Q-Q0)**2.D0/b)**(b/2.D0)/Jeq
 end function psiQ_FF
 
 function integral_psiQ_FF(Q, b, Q0)
@@ -324,6 +325,8 @@ function integral_psiQ_FF(Q, b, Q0)
         integral_psiQ_FF(k) = integral_psiQ_FF(k-1) + &
                               (psiQ_FF(Q(k-1),b,Q0) + psiQ_FF(Q(k),b,Q0))*(Q(k)-Q(k-1))/2.D0
     end do
+    !Trapezoidal rule is far from perfect, but we must have int from 0 to 1
+    integral_psiQ_FF = integral_psiQ_FF/integral_psiQ_FF(size(Q))
 
 end function integral_psiQ_FF
 
@@ -352,30 +355,31 @@ function generate_Ql_eq_FF(N, b, Q0, seed)
     intpsiQ = integral_psiQ_FF(Q,b,Q0)
 
     !Generate N random floats from 0 to 1
-    rands(:) = random_float(seed, N)
+    rands(:) = rand_floats(seed, N)
 
-    !Compute inverse for each
+    !Compute inverse for each, which returns distribution of psiQ_FF
     do k=1,N
-        generate_Ql_eq_FF(k) = inverse_extrap(Q,intpsiQ,rands(k))
+        generate_Ql_eq_FF(k) = inverse_lin_interp(Q,intpsiQ,rands(k))
     end do
 
-end function generate_Ql_eq
+end function generate_Ql_eq_FF
 
-function inverse_extrap(x, fx, fxval)
+function inverse_lin_interp(x, fx, fxval)
     implicit none
     real*8, dimension(:), intent(in) :: x, fx
-    real*8, intent(in) :: fval
-    real*8 :: inverse_extrap
+    real*8, intent(in) :: fxval
+    real*8 :: inverse_lin_interp
     integer :: i, j
 
     do i=1,size(x)
         if (fx(i) > fxval) then
-            inverse_extrap = (fxval-fx(i-1))/(fx(i)-fx(i-1))*(x(i)-x(i-1)) + x(i-1)
+            !linear interpolation
+            inverse_lin_interp = (fxval-fx(i-1))/(fx(i)-fx(i-1))*(x(i)-x(i-1)) + x(i-1)
             EXIT
         end if
    end do
 
-end function inverse_extrap
+end function inverse_lin_interp
 
 function generate_Q_FF(Q0,b, N, seed)
     implicit none
@@ -383,29 +387,42 @@ function generate_Q_FF(Q0,b, N, seed)
     integer*8, intent(inout) :: seed
     integer*8, intent(in) :: N
     real*8, dimension(3,N) :: generate_Q_FF
-    real*8 :: x1, x2, x(N), y(N), z(N), Ql(N)
+    real*8 :: Ql(N)
 
-
-    !generate vectors on surface of unit sphere
-    do i=1,N
-        x1 = random_float(seed,1)*2.D0 - 1.D0
-        x2 = random_float(seed,1)*2.D0 - 1.D0
-        do while ((x1**2 + x2**2).ge.1.D0)
-            x1 = random_float(seed,1)*2.D0 - 1.D0
-            x2 = random_float(seed,1)*2.D0 - 1.D0
-        end do
-        x = 2.D0*x1*sqrt(1.D0-x1**2-x2**2)
-        y = 2.D0*x2*sqrt(1.D0-x1**2-x2**2)
-        z = 1.D0-2.D0*(x1**2 + x2**2)
-
-    end do
+    generate_Q_FF(:,:) = spherical_unit_vectors(N, seed)
 
     Ql(:) = generate_Ql_eq_FF(N, b, Q0, seed)
 
-    generate_Q_FF(1,:) = x*Ql/sqrt(3)
-    generate_Q_FF(2,:) = y*Ql/sqrt(3)
-    generate_Q_FF(3,:) = z*Ql/sqrt(3)
+    generate_Q_FF(1,:) = generate_Q_FF(1,:)*Ql/sqrt(3.D0)
+    generate_Q_FF(2,:) = generate_Q_FF(2,:)*Ql/sqrt(3.D0)
+    generate_Q_FF(3,:) = generate_Q_FF(3,:)*Ql/sqrt(3.D0)
 
 end function generate_Q_FF
+
+function spherical_unit_vectors(N, seed)
+    implicit none
+    integer*8, intent(inout) :: seed
+    integer*8, intent(in) :: N
+    real*8 :: x1, x2, r1(1), r2(1)
+    real*8, dimension(3,N) :: spherical_unit_vectors
+
+    do i=1,N
+        r1 = rand_floats(seed,1)
+        r2 = rand_floats(seed,1)
+        x1 = r1(1)*2.D0 - 1.D0
+        x2 = r2(1)*2.D0 - 1.D0
+        do while ((x1**2 + x2**2).ge.1.D0)
+            r1 = rand_floats(seed,1)
+            r2 = rand_floats(seed,1)
+            x1 = r1(1)*2.D0 - 1.D0
+            x2 = r2(1)*2.D0 - 1.D0
+        end do
+        spherical_unit_vectors(1,i) = 2.D0*x1*sqrt(1.D0-x1**2-x2**2)
+        spherical_unit_vectors(2,i) = 2.D0*x2*sqrt(1.D0-x1**2-x2**2)
+        spherical_unit_vectors(3,i) = 1.D0-2.D0*(x1**2 + x2**2)
+
+    end do
+
+end function spherical_unit_vectors
 
 end program FF_HI_semimp
