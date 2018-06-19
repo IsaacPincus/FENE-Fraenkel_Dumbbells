@@ -5,8 +5,8 @@ real*8, parameter :: PI = 4*atan(1.0D0)
 integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i, Ntraj
 integer :: NTimeSteps, timestep, trajectories, Ndtwidths
 real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Ql, Ql2, F(3), dW(3), Qtemp(3), Bq, Bs, delX(3)
-real*8 :: a2, a4, C43, C83, C143
-real*8, dimension(3,3) :: k, delT
+real*8 :: a2, a4, time1, time2, B_eta, Bpsi, Bpsi2
+real*8, dimension(3,3) :: k, delT, tau
 !large arrays must be declared allocatable so they go into heap, otherwise
 !OpenMP threads run out of memory
 real*8, dimension(:, :), allocatable :: Q
@@ -42,10 +42,7 @@ Serr = 0.D0
 
 a = h*sqrt(PI)
 a2 = a**2
-a4 = a**4
-C43 = 4.D0/3.D0
-C83 = 8.D0/3.D0
-C143 = 14.D0/3.D0
+a4 = a2**2
 
 k(:,:) = 0.D0
 k(1,2) = 1.D0
@@ -65,10 +62,23 @@ looptimesteps: do timestep=1,Ndtwidths
     dt = timestepwidths(timestep)
     NtimeSteps = int(Nrelax_times/dt)
 
-    Q(:,:) = generate_Q_FF(Q0, b, Ntraj, seed)
+    !DOES NOT WORK FOR HOOKEAN, FENE OR FRAENKEL SPRINGS
+    Q(:,:) = generate_Q_FF(Q0, b, Ntraj, seed, 10000)
 
     !$OMP PARALLEL DEFAULT(firstprivate) SHARED(Q)
     !$ seed = seed + 932117 + OMP_get_thread_num()*2685821657736338717_8
+
+    !equilibration for 10 relaxation times or 100 time steps, whichever is larger
+    do steps=1,max(int(10/dt),100)
+        k(1,2) = 0
+
+        !$OMP DO schedule(dynamic, 100)
+        do i=1,Ntraj
+            Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a)
+        end do
+        !$OMP END DO
+
+    end do
 
     do steps=1,Ntimesteps
         k(1,2) = sr
@@ -92,15 +102,30 @@ looptimesteps: do timestep=1,Ndtwidths
 
     !$OMP END PARALLEL
 
+    !Measurements
+    tau = 0
+
     do i=1,Ntraj
         Ql2 = Q(1,i)**2 + Q(2,i)**2 + Q(3,i)**2
         Ql = sqrt(Ql2)
         Bs = dot_product(delX, Q(:,i))**2/Ql2
+        F(:) = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q(:,i)/Ql
+        tau(:,:) = dyadic_prod(Q(:,i), F)
 
         Qavg(timestep) = Qavg(timestep) + Ql2
         Vqavg(timestep) = Vqavg(timestep) + Ql
         S(timestep) = S(timestep) + 0.5*(3*Bs - 1)
         Serr(timestep) = Serr(timestep) + 0.25*(9*Bs**2 - 6*Bs + 1)
+
+        B_eta = tau(1,2)
+        Bpsi = (tau(1,1) - tau(2,2))
+        Bpsi2 = (tau(2,2) - tau(3,3))
+        Aeta(timestep) = Aeta(timestep) + B_eta
+        Apsi(timestep) = Apsi(timestep) + Bpsi
+        Apsi2(timestep) = Apsi2(timestep) + Bpsi2
+        Veta(timestep) = Veta(timestep) + B_eta**2
+        Vpsi(timestep) = Vpsi(timestep) + Bpsi**2
+        Vpsi2(timestep) = Vpsi2(timestep) + Bpsi2**2
     end do
 
 end do looptimesteps
@@ -108,6 +133,18 @@ end do looptimesteps
 !close(unit=21)
 
 deallocate(Q)
+
+Aeta = Aeta/(Ntraj*sr)
+Veta = Veta/(Ntraj*sr**2)
+Veta = sqrt((Veta - Aeta**2)/(Ntraj-1))
+
+Apsi = Apsi/(Ntraj*sr**2)
+Vpsi = Vpsi/(Ntraj*sr**4)
+Vpsi = sqrt((Vpsi - Apsi**2)/(Ntraj-1))
+
+Apsi2 = Apsi2/(Ntraj*sr**2)
+Vpsi2 = Vpsi2/(Ntraj*sr**4)
+Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Ntraj-1))
 
 Qavg = sqrt(Qavg/Ntraj)
 Vqavg = Vqavg/Ntraj
@@ -119,30 +156,53 @@ Serr = sqrt((Serr - S**2)/(Ntraj-1))
 
 open(unit=20, file='Ql.dat')
 open(unit=21, file='S.dat')
+open(unit=22, file='eta.dat')
+open(unit=23, file='psi.dat')
+open(unit=24, file='psi2.dat')
 
-10 format(F4.2,4X,F7.5,4X,F7.5,4X,F7.5,4X,F7.5)
-11 format(F6.3,4X,F12.7,4X,F12.7)
+!10 format(F4.2,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5)
+10 format(F6.3,4X, 2(E12.5, 2X, E12.5, 4X))
+write(*,*) 'dtw       Q             err             S             err'
 do i = 1,Ndtwidths
     write(*,10) timestepwidths(i), Qavg(i), Vqavg(i), S(i), Serr(i)
 end do
 
-write(20,*) 'timestepwidth    avg    err'
+12 format(F6.3,4X, 3(E12.5, 2X, E12.5, 4X))
+write(*,*) 'dtw       eta           err             psi           err       psi2        err'
+do i = 1,Ndtwidths
+    write(*,12) timestepwidths(i), Aeta(i), Veta(i), Apsi(i), Vpsi(i), Apsi2(i), Vpsi2(i)
+end do
+
+
+11 format(F6.3,4X, E12.5, 2X, E12.5, 4X)
+do i=20,24
+    write(i,*) 'timestepwidth    avg    err'
+end do
 do i = 1,Ndtwidths
     write(20,11) timestepwidths(i), Qavg(i), Vqavg(i)
     write(21,11) timestepwidths(i), S(i), Serr(i)
+    write(22,11) timestepwidths(i), Aeta(i), Veta(i)
+    write(23,11) timestepwidths(i), Apsi(i), Vpsi(i)
+    write(24,11) timestepwidths(i), Apsi2(i), Vpsi2(i)
 end do
 
 close(unit=20)
 close(unit=21)
+close(unit=22)
+close(unit=23)
+close(unit=24)
 
 contains
 
-pure function construct_B(Q, a, delT)
+function construct_B(Q, a, delT)
     implicit none
     real*8, intent(in) :: Q(3), a
     real*8, intent(in) :: delT(3,3)
     real*8, dimension(3,3) :: construct_B
     real*8 :: Ql, aux, g, g_til, Ql2, Ql4, Ql6
+    real*8, save :: C43 = 4.D0/3.D0
+    real*8, save :: C83 = 8.D0/3.D0
+    real*8, save :: C143 = 14.D0/3.D0
 
     Ql2 = Q(1)**2 + Q(2)**2 + Q(3)**2
     Ql = sqrt(Ql2)
@@ -246,7 +306,6 @@ end function step
 
 pure function find_roots(a, b, c, Q0, lim)
     implicit none
-!    real*8, parameter :: PI = 4*atan(1.0D0)
     real*8, intent(in) :: a, b, c, Q0, lim
     real*8 :: find_roots
     real*8 :: Q, R, theta, x
@@ -261,6 +320,7 @@ pure function find_roots(a, b, c, Q0, lim)
         x = -2.D0*sqrt(Q)*cos((theta + real(i)*PI*2.D0)/3.D0)-a/3.D0
         if ((x.ge.(Q0-lim)).and.(x.le.(Q0+lim))) then
             find_roots = x
+            EXIT
         end if
    end do
 
@@ -330,34 +390,32 @@ function integral_psiQ_FF(Q, b, Q0)
 
 end function integral_psiQ_FF
 
-function generate_Ql_eq_FF(N, b, Q0, seed)
+function generate_Ql_eq_FF(N, b, Q0, seed, Nsteps)
     implicit none
     real*8, intent(in) :: b, Q0
-    integer*8, intent(in) :: N
+    integer*8, intent(in) :: N, Nsteps
     integer*8, intent(inout) :: seed
     integer :: k
     real*8, dimension(N) :: generate_Ql_eq_FF, rands
-    real*8, dimension(20) :: Q, intpsiQ
+    real*8, dimension(Nsteps) :: Q, intpsiQ
     real*8 :: width
 
-    !Generate a Q vector between Q0-sqrt(b) and Q0+sqrt(b) with 20 steps
+    !Generate a Q vector between Q0-sqrt(b) and Q0+sqrt(b) with Nsteps steps
     !Round off a little at the end to prevent singularities
-    width = 2.D0*sqrt(b)/(20-1)
+    width = 2.D0*sqrt(b)/(Nsteps-1)
     Q = 0.D0
     Q(1) = Q0-sqrt(b)
-    do k=2,20
+    do k=2,Nsteps
         Q(k) = Q(k-1) + width
     end do
     Q(1) = Q(1) + 0.0000001D0
-    Q(20) = Q(20) - 0.0000001D0
+    Q(Nsteps) = Q(Nsteps) - 0.0000001D0
 
-    !Generate integral of psiQ
     intpsiQ = integral_psiQ_FF(Q,b,Q0)
 
-    !Generate N random floats from 0 to 1
     rands(:) = rand_floats(seed, N)
 
-    !Compute inverse for each, which returns distribution of psiQ_FF
+    !Inverse of integral returns distribution of psiQ_FF
     do k=1,N
         generate_Ql_eq_FF(k) = inverse_lin_interp(Q,intpsiQ,rands(k))
     end do
@@ -373,7 +431,6 @@ function inverse_lin_interp(x, fx, fxval)
 
     do i=1,size(x)
         if (fx(i) > fxval) then
-            !linear interpolation
             inverse_lin_interp = (fxval-fx(i-1))/(fx(i)-fx(i-1))*(x(i)-x(i-1)) + x(i-1)
             EXIT
         end if
@@ -381,17 +438,17 @@ function inverse_lin_interp(x, fx, fxval)
 
 end function inverse_lin_interp
 
-function generate_Q_FF(Q0,b, N, seed)
+function generate_Q_FF(Q0,b, N, seed, Nsteps)
     implicit none
     real*8, intent(in) :: Q0, b
     integer*8, intent(inout) :: seed
-    integer*8, intent(in) :: N
+    integer*8, intent(in) :: N, Nsteps
     real*8, dimension(3,N) :: generate_Q_FF
     real*8 :: Ql(N)
 
     generate_Q_FF(:,:) = spherical_unit_vectors(N, seed)
 
-    Ql(:) = generate_Ql_eq_FF(N, b, Q0, seed)
+    Ql(:) = generate_Ql_eq_FF(N, b, Q0, seed, Nsteps)
 
     generate_Q_FF(1,:) = generate_Q_FF(1,:)*Ql/sqrt(3.D0)
     generate_Q_FF(2,:) = generate_Q_FF(2,:)*Ql/sqrt(3.D0)
