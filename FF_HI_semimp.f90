@@ -450,9 +450,9 @@ function generate_Q_FF(Q0,b, N, seed, Nsteps)
 
     Ql(:) = generate_Ql_eq_FF(N, b, Q0, seed, Nsteps)
 
-    generate_Q_FF(1,:) = generate_Q_FF(1,:)*Ql/sqrt(3.D0)
-    generate_Q_FF(2,:) = generate_Q_FF(2,:)*Ql/sqrt(3.D0)
-    generate_Q_FF(3,:) = generate_Q_FF(3,:)*Ql/sqrt(3.D0)
+    generate_Q_FF(1,:) = generate_Q_FF(1,:)*Ql
+    generate_Q_FF(2,:) = generate_Q_FF(2,:)*Ql
+    generate_Q_FF(3,:) = generate_Q_FF(3,:)*Ql
 
 end function generate_Q_FF
 
