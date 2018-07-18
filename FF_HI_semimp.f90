@@ -2,7 +2,7 @@ program FF_HI_semimp
 use omp_lib
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
-integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i, Ntraj, VR_opt
+integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i, Ntraj, VR_opt, dist_opt
 integer :: NTimeSteps, timestep, trajectories, Ndtwidths
 real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Ql, Ql2, F(3), dW(3), Qtemp(3), Bq, Bs, delX(3)
 real*8 :: a2, a4, time1, time2, B_eta, Bpsi, Bpsi2
@@ -19,8 +19,9 @@ seed = time(8)*100 + time(7)*10
 open(unit=31, file='inputparameters.inp')
 open(unit=30, file='timestepdata.inp')
 open(unit=32, file='options.inp')
+open(unit=25, file='Q_dist_output.dat')
 
-read (32, *) VR_opt
+read (32, *) VR_opt, dist_opt
 read (31, *) sr, b, h, Q0
 read (30, *) Ntraj, Ndtwidths, Nrelax_times
 allocate(timestepwidths(Ndtwidths))
@@ -68,24 +69,12 @@ looptimesteps: do timestep=1,Ndtwidths
     dt = timestepwidths(timestep)
     NtimeSteps = int(Nrelax_times/dt)
 
-    !DOES NOT WORK WHEN Q0-sqrt(b) < 0
+    !Also works for Fraenkel, FENE and Hookean springs
+    !Reduce final input for faster computation of equilibrium dist
     Q(:,:) = generate_Q_FF(Q0, b, Ntraj, seed, 10000)
 
     !$OMP PARALLEL DEFAULT(firstprivate) SHARED(Q, Q_eq_VR, VR_opt)
     !$ seed = seed + 932117 + OMP_get_thread_num()*2685821657736338717_8
-
-    !equilibration for 10 relaxation times or 100 time steps, whichever is larger
-    do steps=1,max(int(10/dt),100)
-        k(1,2) = 0
-
-        !$OMP DO schedule(dynamic, 100)
-        do i=1,Ntraj
-            dW = Wiener_step(seed, dt)
-            Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a, dW)
-        end do
-        !$OMP END DO
-
-    end do
 
     if (VR_opt.eq.0) then
         do steps=1,Ntimesteps
@@ -131,9 +120,18 @@ looptimesteps: do timestep=1,Ndtwidths
         print *, "Variance Reduction option not set, place in options.inp file"
     end if
 
+    if (dist_opt.eq.1) then
+        25 format(2(E12.5,4X), E12.5)
+        write(25, *) 'Timestep width is: ', dt
+        do i=1,Ntraj
+            write(25, 25) Q(:,i)
+        end do
+    end if
+
 end do looptimesteps
 
 !close(unit=21)
+close(unit=25)
 
 deallocate(Q)
 if (VR_opt.eq.1) then
@@ -446,33 +444,32 @@ pure function beta(x,y)
     beta = exp(beta)
 end function beta
 
-function psiQ_FF(Q, b, Q0)
+function psiQ_FF(Q, b, Q0, Jeq)
     implicit none
-    real*8, intent(in) :: Q, b, Q0
-    real*8 :: Jeq
+    real*8, intent(in) :: Q, b, Q0, Jeq
     real*8 :: psiQ_FF
 
-    Jeq = (1.D0/(b+3.D0)+Q0**2/b)*beta(0.5D0,(b+2.D0)/2.D0)*b**(1.5D0)
+!    Jeq = (1.D0/(b+3.D0)+Q0**2/b)*beta(0.5D0,(b+2.D0)/2.D0)*b**(1.5D0)
 
     psiQ_FF = Q**2*(1.D0-(Q-Q0)**2.D0/b)**(b/2.D0)/Jeq
 end function psiQ_FF
 
-function integral_psiQ_FF(Q, b, Q0)
+function integral_psiQ_FF(Q, b, Q0, Jeq)
     !Simple cumulative trapezoidal integral of psiQ_FF at
     !points specified in Q
     implicit none
     real*8, dimension(:), intent(in) :: Q
-    real*8, intent(in) :: b, Q0
+    real*8, intent(in) :: b, Q0, Jeq
     real*8, dimension(size(Q)) :: integral_psiQ_FF
     integer :: k
 
     integral_psiQ_FF(1) = 0.D0
     do k=2,size(Q)
         integral_psiQ_FF(k) = integral_psiQ_FF(k-1) + &
-                              (psiQ_FF(Q(k-1),b,Q0) + psiQ_FF(Q(k),b,Q0))*(Q(k)-Q(k-1))/2.D0
+                              (psiQ_FF(Q(k-1),b,Q0, Jeq) + psiQ_FF(Q(k),b,Q0, Jeq))*(Q(k)-Q(k-1))/2.D0
     end do
     !Trapezoidal rule is far from perfect, but we must have int from 0 to 1
-    integral_psiQ_FF = integral_psiQ_FF/integral_psiQ_FF(size(Q))
+!    integral_psiQ_FF = integral_psiQ_FF/integral_psiQ_FF(size(Q))
 
 end function integral_psiQ_FF
 
@@ -484,20 +481,32 @@ function generate_Ql_eq_FF(N, b, Q0, seed, Nsteps)
     integer :: k
     real*8, dimension(N) :: generate_Ql_eq_FF, rands
     real*8, dimension(Nsteps) :: Q, intpsiQ
-    real*8 :: width
+    real*8 :: width, Jeq
 
     !Generate a Q vector between Q0-sqrt(b) and Q0+sqrt(b) with Nsteps steps
     !Round off a little at the end to prevent singularities
-    width = 2.D0*sqrt(b)/(Nsteps-1)
     Q = 0.D0
-    Q(1) = Q0-sqrt(b)
+    if (Q0-sqrt(b).le.0.D0) then
+        width = (Q0+sqrt(b))/(Nsteps-1)
+        Q(1) = 0.D0
+    else
+        width = 2.D0*sqrt(b)/(Nsteps-1)
+        Q(1) = Q0-sqrt(b)
+    end if
     do k=2,Nsteps
         Q(k) = Q(k-1) + width
     end do
     Q(1) = Q(1) + 0.0000001D0
     Q(Nsteps) = Q(Nsteps) - 0.0000001D0
 
-    intpsiQ = integral_psiQ_FF(Q,b,Q0)
+!   determine normalisation constant
+!   Is this needed? It's normalised anyway... TODO
+    intpsiQ = integral_psiQ_FF(Q,b,Q0, 1.D0)
+    Jeq = intpsiQ(size(Q))
+!   perform actual integration and normalise to 1
+    intpsiQ = integral_psiQ_FF(Q,b,Q0,Jeq)
+    Jeq = intpsiQ(size(Q))
+    intpsiQ = intpsiQ/Jeq
 
     rands(:) = rand_floats(seed, N)
 
