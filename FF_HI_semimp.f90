@@ -2,14 +2,14 @@ program FF_HI_semimp
 use omp_lib
 implicit none
 real*8, parameter :: PI = 4*atan(1.0D0)
-integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i, Ntraj
+integer*8 :: Nblocks, Nsteps, steps, block, time(1:8), seed, i, Ntraj, VR_opt
 integer :: NTimeSteps, timestep, trajectories, Ndtwidths
 real*8 :: sr, b, h, a, Q0, Nrelax_times, dt, Ql, Ql2, F(3), dW(3), Qtemp(3), Bq, Bs, delX(3)
 real*8 :: a2, a4, time1, time2, B_eta, Bpsi, Bpsi2
 real*8, dimension(3,3) :: k, delT, tau
 !large arrays must be declared allocatable so they go into heap, otherwise
 !OpenMP threads run out of memory
-real*8, dimension(:, :), allocatable :: Q
+real*8, dimension(:, :), allocatable :: Q, Q_eq_VR
 real*8, dimension(:), allocatable :: timestepwidths, Aeta, Veta, Apsi, Vpsi, Apsi2, Vpsi2
 real*8, dimension(:), allocatable :: Qavg, Vqavg, S, Serr
 
@@ -18,7 +18,9 @@ seed = time(8)*100 + time(7)*10
 
 open(unit=31, file='inputparameters.inp')
 open(unit=30, file='timestepdata.inp')
+open(unit=32, file='options.inp')
 
+read (32, *) VR_opt
 read (31, *) sr, b, h, Q0
 read (30, *) Ntraj, Ndtwidths, Nrelax_times
 allocate(timestepwidths(Ndtwidths))
@@ -27,8 +29,12 @@ do i=1,Ndtwidths
 end do
 
 allocate(Q(3,1:Ntraj))
+if (VR_opt.eq.1) then
+    allocate(Q_eq_VR(3,1:Ntraj))
+end if
 allocate(Aeta(Ndtwidths), Veta(Ndtwidths), Apsi(Ndtwidths), Vpsi(Ndtwidths), Apsi2(Ndtwidths), Vpsi2(Ndtwidths))
 allocate(Qavg(Ndtwidths), Vqavg(Ndtwidths), S(Ndtwidths), Serr(Ndtwidths))
+
 Aeta = 0.D0
 Apsi = 0.D0
 Apsi2 = 0.D0
@@ -62,10 +68,10 @@ looptimesteps: do timestep=1,Ndtwidths
     dt = timestepwidths(timestep)
     NtimeSteps = int(Nrelax_times/dt)
 
-    !DOES NOT WORK FOR HOOKEAN, FENE OR FRAENKEL SPRINGS
+    !DOES NOT WORK WHEN Q0-sqrt(b) < 0
     Q(:,:) = generate_Q_FF(Q0, b, Ntraj, seed, 10000)
 
-    !$OMP PARALLEL DEFAULT(firstprivate) SHARED(Q)
+    !$OMP PARALLEL DEFAULT(firstprivate) SHARED(Q, Q_eq_VR, VR_opt)
     !$ seed = seed + 932117 + OMP_get_thread_num()*2685821657736338717_8
 
     !equilibration for 10 relaxation times or 100 time steps, whichever is larger
@@ -74,35 +80,146 @@ looptimesteps: do timestep=1,Ndtwidths
 
         !$OMP DO schedule(dynamic, 100)
         do i=1,Ntraj
-            Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a)
+            dW = Wiener_step(seed, dt)
+            Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a, dW)
         end do
         !$OMP END DO
 
     end do
 
-    do steps=1,Ntimesteps
-        k(1,2) = sr
-
-        !$OMP DO schedule(dynamic, 100)
-        do i=1,Ntraj
-            Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a)
+    if (VR_opt.eq.0) then
+        do steps=1,Ntimesteps
+            k(1,2) = sr
+            !$OMP DO schedule(dynamic, 100)
+            do i=1,Ntraj
+                dW = Wiener_step(seed, dt)
+                Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a, dW)
+            end do
+            !$OMP END DO
         end do
-        !$OMP END DO
 
-!        if (mod(steps,200).eq.0) then
-!            !$OMP SINGLE
-!            write(21, *) 'Time is ', dt*steps
-!            do i=1,Ntraj
-!                write(21,"(F12.7,4X,F12.7,4X,F12.7)") Q(:,i)
-!            end do
-!            !$OMP END SINGLE
-!        end if
+    elseif (VR_opt.eq.1) then
+        !call step_with_VR()
+        !$OMP single
+        Q_eq_VR(:,:) = Q(:,:)
+        !$OMP end single
 
-    end do
+        do steps=1,Ntimesteps
+
+            !$OMP DO schedule(dynamic, 100)
+            do i=1,Ntraj
+                dW = Wiener_step(seed, dt)
+                k(1,2) = sr
+                Q(:,i) =  step(Q(:,i), k, dt, Q0, delT, b, a, dW)
+                k(1,2) = 0.D0
+                Q_eq_VR(:,i) = step(Q_eq_VR(:,i), k, dt, Q0, delT, b, a, dW)
+            end do
+            !$OMP END DO
+        end do
+
+    else
+        print *, "Variance Reduction option not set, place in options.inp file"
+    end if
 
     !$OMP END PARALLEL
 
-    !Measurements
+    if (VR_opt.eq.0) then
+        call measure_no_VR()
+    elseif (VR_opt.eq.1) then
+        call measure_with_VR()
+    else
+        print *, "Variance Reduction option not set, place in options.inp file"
+    end if
+
+end do looptimesteps
+
+!close(unit=21)
+
+deallocate(Q)
+if (VR_opt.eq.1) then
+    deallocate(Q_eq_VR)
+end if
+
+Aeta = Aeta/(Ntraj*sr)
+Veta = Veta/(Ntraj*sr**2)
+Veta = sqrt((Veta - Aeta**2)/(Ntraj-1))
+
+Apsi = Apsi/(Ntraj*sr**2)
+Vpsi = Vpsi/(Ntraj*sr**4)
+Vpsi = sqrt((Vpsi - Apsi**2)/(Ntraj-1))
+
+Apsi2 = Apsi2/(Ntraj*sr**2)
+Vpsi2 = Vpsi2/(Ntraj*sr**4)
+Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Ntraj-1))
+
+Qavg = sqrt(Qavg/Ntraj)
+Vqavg = Vqavg/Ntraj
+Vqavg = sqrt((Qavg**2 - Vqavg**2)/(Ntraj-1))
+
+S = S/Ntraj
+Serr = Serr/Ntraj
+Serr = sqrt((Serr - S**2)/(Ntraj-1))
+
+call Write_data()
+
+contains
+
+subroutine measure_with_VR()
+    implicit none
+        !Measurements
+    tau = 0
+
+    do i=1,Ntraj
+        !Add from shear-flow dumbbell
+        Ql2 = Q(1,i)**2 + Q(2,i)**2 + Q(3,i)**2
+        Ql = sqrt(Ql2)
+        Bs = dot_product(delX, Q(:,i))**2/Ql2
+        F(:) = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q(:,i)/Ql
+        tau(:,:) = dyadic_prod(Q(:,i), F)
+
+        Qavg(timestep) = Qavg(timestep) + Ql2
+        Vqavg(timestep) = Vqavg(timestep) + Ql
+        S(timestep) = S(timestep) + 0.5*(3*Bs - 1)
+        Serr(timestep) = Serr(timestep) + 0.25*(9*Bs**2 - 6*Bs + 1)
+
+        B_eta = tau(1,2)
+        Bpsi = (tau(1,1) - tau(2,2))
+        Bpsi2 = (tau(2,2) - tau(3,3))
+!        Aeta(timestep) = Aeta(timestep) + B_eta
+!        Apsi(timestep) = Apsi(timestep) + Bpsi
+!        Apsi2(timestep) = Apsi2(timestep) + Bpsi2
+!        Veta(timestep) = Veta(timestep) + B_eta**2
+!        Vpsi(timestep) = Vpsi(timestep) + Bpsi**2
+!        Vpsi2(timestep) = Vpsi2(timestep) + Bpsi2**2
+
+        !subtract from equilibrium Dumbbell
+        Ql2 = Q_eq_VR(1,i)**2 + Q_eq_VR(2,i)**2 + Q_eq_VR(3,i)**2
+        Ql = sqrt(Ql2)
+        Bs = dot_product(delX, Q_eq_VR(:,i))**2/Ql2
+        F(:) = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q_eq_VR(:,i)/Ql
+        tau(:,:) = dyadic_prod(Q_eq_VR(:,i), F)
+
+        !Qavg(timestep) = Qavg(timestep) - Ql2
+        !Vqavg(timestep) = Vqavg(timestep) - Ql
+        S(timestep) = S(timestep) - 0.5*(3*Bs - 1)
+        Serr(timestep) = Serr(timestep) - 0.25*(9*Bs**2 - 6*Bs + 1)
+
+        B_eta = B_eta - tau(1,2)
+        Bpsi = Bpsi - (tau(1,1) - tau(2,2))
+        Bpsi2 = Bpsi2 - (tau(2,2) - tau(3,3))
+        Aeta(timestep) = Aeta(timestep) + B_eta
+        Apsi(timestep) = Apsi(timestep) + Bpsi
+        Apsi2(timestep) = Apsi2(timestep) + Bpsi2
+        Veta(timestep) = Veta(timestep) + B_eta**2
+        Vpsi(timestep) = Vpsi(timestep) + Bpsi**2
+        Vpsi2(timestep) = Vpsi2(timestep) + Bpsi2**2
+    end do
+
+end subroutine
+
+subroutine measure_no_VR()
+    implicit none
+        !Measurements
     tau = 0
 
     do i=1,Ntraj
@@ -128,71 +245,49 @@ looptimesteps: do timestep=1,Ndtwidths
         Vpsi2(timestep) = Vpsi2(timestep) + Bpsi2**2
     end do
 
-end do looptimesteps
+end subroutine
 
-!close(unit=21)
+subroutine Write_data()
+    implicit none
+    open(unit=20, file='Ql.dat')
+    open(unit=21, file='S.dat')
+    open(unit=22, file='eta.dat')
+    open(unit=23, file='psi.dat')
+    open(unit=24, file='psi2.dat')
 
-deallocate(Q)
+    !10 format(F4.2,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5)
+    10 format(F6.3,4X, 2(E12.5, 2X, E12.5, 4X))
+    write(*,*) 'dtw       Q             err             S             err'
+    do i = 1,Ndtwidths
+        write(*,10) timestepwidths(i), Qavg(i), Vqavg(i), S(i), Serr(i)
+    end do
 
-Aeta = Aeta/(Ntraj*sr)
-Veta = Veta/(Ntraj*sr**2)
-Veta = sqrt((Veta - Aeta**2)/(Ntraj-1))
-
-Apsi = Apsi/(Ntraj*sr**2)
-Vpsi = Vpsi/(Ntraj*sr**4)
-Vpsi = sqrt((Vpsi - Apsi**2)/(Ntraj-1))
-
-Apsi2 = Apsi2/(Ntraj*sr**2)
-Vpsi2 = Vpsi2/(Ntraj*sr**4)
-Vpsi2 = sqrt((Vpsi2 - Apsi2**2)/(Ntraj-1))
-
-Qavg = sqrt(Qavg/Ntraj)
-Vqavg = Vqavg/Ntraj
-Vqavg = sqrt((Qavg**2 - Vqavg**2)/(Ntraj-1))
-
-S = S/Ntraj
-Serr = Serr/Ntraj
-Serr = sqrt((Serr - S**2)/(Ntraj-1))
-
-open(unit=20, file='Ql.dat')
-open(unit=21, file='S.dat')
-open(unit=22, file='eta.dat')
-open(unit=23, file='psi.dat')
-open(unit=24, file='psi2.dat')
-
-!10 format(F4.2,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5,4X,F7.5,2X,F7.5)
-10 format(F6.3,4X, 2(E12.5, 2X, E12.5, 4X))
-write(*,*) 'dtw       Q             err             S             err'
-do i = 1,Ndtwidths
-    write(*,10) timestepwidths(i), Qavg(i), Vqavg(i), S(i), Serr(i)
-end do
-
-12 format(F6.3,4X, 3(E12.5, 2X, E12.5, 4X))
-write(*,*) 'dtw       eta           err             psi           err       psi2        err'
-do i = 1,Ndtwidths
-    write(*,12) timestepwidths(i), Aeta(i), Veta(i), Apsi(i), Vpsi(i), Apsi2(i), Vpsi2(i)
-end do
+    12 format(F6.3,4X, 3(E12.5, 2X, E12.5, 4X))
+    write(*,*) 'dtw       eta           err             psi           err       psi2        err'
+    do i = 1,Ndtwidths
+        write(*,12) timestepwidths(i), Aeta(i), Veta(i), Apsi(i), Vpsi(i), Apsi2(i), Vpsi2(i)
+    end do
 
 
-11 format(F6.3,4X, E12.5, 2X, E12.5, 4X)
-do i=20,24
-    write(i,*) 'timestepwidth    avg    err'
-end do
-do i = 1,Ndtwidths
-    write(20,11) timestepwidths(i), Qavg(i), Vqavg(i)
-    write(21,11) timestepwidths(i), S(i), Serr(i)
-    write(22,11) timestepwidths(i), Aeta(i), Veta(i)
-    write(23,11) timestepwidths(i), Apsi(i), Vpsi(i)
-    write(24,11) timestepwidths(i), Apsi2(i), Vpsi2(i)
-end do
+    11 format(F6.3,4X, E15.8, 2X, E15.8, 4X)
+    do i=20,24
+        write(i,*) 'timestepwidth    avg    err'
+    end do
+    do i = 1,Ndtwidths
+        write(20,11) timestepwidths(i), Qavg(i), Vqavg(i)
+        write(21,11) timestepwidths(i), S(i), Serr(i)
+        write(22,11) timestepwidths(i), Aeta(i), Veta(i)
+        write(23,11) timestepwidths(i), Apsi(i), Vpsi(i)
+        write(24,11) timestepwidths(i), Apsi2(i), Vpsi2(i)
+    end do
 
-close(unit=20)
-close(unit=21)
-close(unit=22)
-close(unit=23)
-close(unit=24)
+    close(unit=20)
+    close(unit=21)
+    close(unit=22)
+    close(unit=23)
+    close(unit=24)
 
-contains
+end subroutine
 
 function construct_B(Q, a, delT)
     implicit none
@@ -260,11 +355,11 @@ function Wiener_step(seed, dt)
 
 end function Wiener_step
 
-function step(Q, k, dt, Q0, delT, b, a)
+function step(Q, k, dt, Q0, delT, b, a, dW)
     implicit none
-    real*8, intent(in) :: Q(3), dt, Q0, b, a
+    real*8, intent(in) :: Q(3), dt, Q0, b, a, dW(3)
     real*8, intent(in) :: delT(3,3), k(3,3)
-    real*8 :: Ql, L, RdotB2_L, Qlength, temp_R1, temp_R2, dW(3)
+    real*8 :: Ql, L, RdotB2_L, Qlength, temp_R1, temp_R2
     real*8, dimension(3) :: F, u, RHS, Qpred, RdotB2
     real*8, dimension(3,3) :: B1, B2, B1B1, B2B2
     real*8, dimension(3) :: step
@@ -273,7 +368,6 @@ function step(Q, k, dt, Q0, delT, b, a)
     F = (Ql - Q0)/(1.0D0-(Ql-Q0)**2/b)*Q/Ql
 
     B1 = construct_B(Q, a, delT)
-    dw = Wiener_step(seed, dt)
 
     B1B1 = matmul(B1,B1)
     Qpred = Q(:) + (ten_vec_dot(k,Q) - 0.5D0*ten_vec_dot(B1B1,F))*dt &
@@ -291,14 +385,6 @@ function step(Q, k, dt, Q0, delT, b, a)
 
     Qlength = find_roots( -(2.D0*Q0+L), -b+Q0**2-RdotB2_L+2.d0*L*Q0, &
                             RdotB2_L*Q0+L*(b-Q0**2), Q0, sqrt(b) )
-
-    !Check that Qlength is +ve, otherwise Q won't point in direction of RHS
-    if (Qlength.le.0) then
-        write(*,*) 'Qlength =< 0'
-        write(*,*) Qlength, Q
-        Qlength = find_roots( -(2.D0*Q0-L), -b+Q0**2-RdotB2_L-2.d0*L*Q0, &
-                            RdotB2_L*Q0-L*(b-Q0**2), Q0, sqrt(b) )
-    endif
 
     step = RHS*Qlength/L
 
